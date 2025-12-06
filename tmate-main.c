@@ -25,8 +25,10 @@ static char *cmdline_end;
 
 struct tmate_settings _tmate_settings = {
 	.keys_dir        	= TMATE_SSH_DEFAULT_KEYS_DIR,
-	.ssh_port        	= TMATE_SSH_DEFAULT_PORT,
-	.ssh_port_advertized    = -1,
+	.daemon_port        	= TMATE_SSH_DEFAULT_PORT,
+	.daemon_port_advertized = -1,
+	.client_port        	= -1, /* Will default to daemon_port if not specified */
+	.client_port_advertized = -1,
 	.websocket_hostname  	= NULL,
 	.bind_addr	 	= NULL,
 	.websocket_port      	= TMATE_DEFAULT_WEBSOCKET_PORT,
@@ -50,7 +52,7 @@ void request_server_termination(void)
 
 static void usage(void)
 {
-	fprintf(stderr, "usage: tmate-ssh-server [-A] [-b ip] [-h hostname] [-k keys_dir] [-p listen_port] [-q ssh_port_advertized] [-w websocket_hostname] [-z websocket_port] [-x] [-v]\n");
+	fprintf(stderr, "usage: tmate-ssh-server [-A] [-b ip] [-h hostname] [-k keys_dir] [-p daemon_port] [-c client_port] [-q daemon_port_advertized] [-C client_port_advertized] [-w websocket_hostname] [-z websocket_port] [-x] [-v]\n");
 }
 
 static char* get_full_hostname(void)
@@ -121,7 +123,7 @@ int main(int argc, char **argv, char **envp)
 {
 	int opt;
 
-	while ((opt = getopt(argc, argv, "Ab:h:k:p:q:w:z:xv")) != -1) {
+	while ((opt = getopt(argc, argv, "Ab:h:k:p:c:q:C:w:z:xv")) != -1) {
 		switch (opt) {
 		case 'A':
 			tmate_settings->authorized_keys_only = true;
@@ -136,10 +138,16 @@ int main(int argc, char **argv, char **envp)
 			tmate_settings->keys_dir = xstrdup(optarg);
 			break;
 		case 'p':
-			tmate_settings->ssh_port = atoi(optarg);
+			tmate_settings->daemon_port = atoi(optarg);
+			break;
+		case 'c':
+			tmate_settings->client_port = atoi(optarg);
 			break;
 		case 'q':
-			tmate_settings->ssh_port_advertized = atoi(optarg);
+			tmate_settings->daemon_port_advertized = atoi(optarg);
+			break;
+		case 'C':
+			tmate_settings->client_port_advertized = atoi(optarg);
 			break;
 		case 'w':
 			tmate_settings->websocket_hostname = xstrdup(optarg);
@@ -158,6 +166,10 @@ int main(int argc, char **argv, char **envp)
 			return 1;
 		}
 	}
+
+	/* If client_port was not explicitly set with -c, default to daemon_port */
+	if (tmate_settings->client_port == -1)
+		tmate_settings->client_port = tmate_settings->daemon_port;
 
 	init_logging(tmate_settings->log_level);
 
@@ -190,7 +202,8 @@ int main(int argc, char **argv, char **envp)
 			    "Try deleting " TMATE_WORKDIR " and try again");
 
 	tmate_ssh_server_main(tmate_session,
-			      tmate_settings->keys_dir, tmate_settings->bind_addr, tmate_settings->ssh_port);
+			      tmate_settings->keys_dir, tmate_settings->bind_addr,
+			      tmate_settings->daemon_port, tmate_settings->client_port);
 	return 0;
 }
 

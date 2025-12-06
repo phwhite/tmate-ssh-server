@@ -9,6 +9,8 @@
 #include <signal.h>
 #include <event.h>
 #include <arpa/inet.h>
+#include <errno.h>
+#include <string.h>
 #ifndef IPPROTO_TCP
 #include <netinet/in.h>
 #endif
@@ -20,12 +22,12 @@ char *get_ssh_conn_string(const char *session_token)
 	char port_arg[16] = {0};
 	char *ret;
 
-	int ssh_port_advertized = tmate_settings->ssh_port_advertized == -1 ?
-		tmate_settings->ssh_port :
-		tmate_settings->ssh_port_advertized;
+	int client_port_advertized = tmate_settings->client_port_advertized == -1 ?
+		tmate_settings->client_port :
+		tmate_settings->client_port_advertized;
 
-	if (ssh_port_advertized != 22)
-		sprintf(port_arg, " -p%d", ssh_port_advertized);
+	if (client_port_advertized != 22)
+		sprintf(port_arg, " -p%d", client_port_advertized);
 	xasprintf(&ret, "ssh%s %s@%s", port_arg, session_token, tmate_settings->tmate_host);
 	return ret;
 }
@@ -54,6 +56,13 @@ static int shell_request(__unused ssh_session session,
 	if (client->role)
 		return 1;
 
+	/* In dual-port mode, only allow PTY client role on client port */
+	if (tmate_settings->daemon_port != tmate_settings->client_port &&
+	    client->connection_port != tmate_settings->client_port) {
+		tmate_info("Denied shell request on daemon port (ip=%s)", client->ip_address);
+		return 1;
+	}
+
 	client->role = TMATE_ROLE_PTY_CLIENT;
 
 	return 0;
@@ -68,8 +77,15 @@ static int subsystem_request(__unused ssh_session session,
 	if (client->role)
 		return 1;
 
-	if (!strcmp(subsystem, "tmate"))
+	if (!strcmp(subsystem, "tmate")) {
+		/* In dual-port mode, only allow daemon role on daemon port */
+		if (tmate_settings->daemon_port != tmate_settings->client_port &&
+		    client->connection_port != tmate_settings->daemon_port) {
+			tmate_info("Denied daemon subsystem request on client port (ip=%s)", client->ip_address);
+			return 1;
+		}
 		client->role = TMATE_ROLE_DAEMON;
+	}
 
 	return 0;
 }
@@ -85,6 +101,13 @@ static int exec_request(__unused ssh_session session,
 
 	if (!tmate_has_websocket())
 		return 1;
+
+	/* In dual-port mode, allow exec on client port (for websocket-based command execution) */
+	if (tmate_settings->daemon_port != tmate_settings->client_port &&
+	    client->connection_port != tmate_settings->client_port) {
+		tmate_info("Denied exec request on daemon port (ip=%s)", client->ip_address);
+		return 1;
+	}
 
 	client->role = TMATE_ROLE_EXEC;
 	client->exec_command = xstrdup(command);
@@ -452,17 +475,20 @@ static void handle_sigchld(__unused int sig)
 }
 
 void tmate_ssh_server_main(struct tmate_session *session, const char *keys_dir,
-			   const char *bind_addr, int port)
+			   const char *bind_addr, int daemon_port, int client_port)
 {
 	struct tmate_ssh_client *client = &session->ssh_client;
-	ssh_bind bind;
+	ssh_bind daemon_bind, client_bind = NULL;
 	pid_t pid;
-	int fd;
+	int fd, accepted_port;
+	bool dual_port_mode = (daemon_port != client_port);
 
 	tmate_catch_sigsegv();
 	signal(SIGCHLD, handle_sigchld);
 
-	bind = prepare_ssh(keys_dir, bind_addr, port);
+	daemon_bind = prepare_ssh(keys_dir, bind_addr, daemon_port);
+	if (dual_port_mode)
+		client_bind = prepare_ssh(keys_dir, bind_addr, client_port);
 
 	client->session = ssh_new();
 	client->channel = NULL;
@@ -473,40 +499,125 @@ void tmate_ssh_server_main(struct tmate_session *session, const char *keys_dir,
 	if (!client->session)
 		tmate_fatal("Cannot initialize session");
 
-	for (;;) {
-		fd = accept(ssh_bind_get_fd(bind), NULL, NULL);
-		if (fd < 0)
-			tmate_fatal("Error accepting connection");
+	if (dual_port_mode) {
+		/* Dual port mode: listen on separate daemon and client ports */
+		fd_set readfds;
+		int daemon_fd, client_fd, max_fd;
 
-		if ((pid = fork()) < 0)
-			tmate_fatal("Can't fork");
+		daemon_fd = ssh_bind_get_fd(daemon_bind);
+		client_fd = ssh_bind_get_fd(client_bind);
+		max_fd = (daemon_fd > client_fd) ? daemon_fd : client_fd;
 
-		if (pid) {
-			/* Parent process */
-			close(fd);
-			continue;
+		for (;;) {
+			FD_ZERO(&readfds);
+			FD_SET(daemon_fd, &readfds);
+			FD_SET(client_fd, &readfds);
+
+			if (select(max_fd + 1, &readfds, NULL, NULL, NULL) < 0) {
+				if (errno == EINTR)
+					continue;
+				tmate_fatal("Error in select: %s", strerror(errno));
+			}
+
+			fd = -1;
+			accepted_port = 0;
+
+			if (FD_ISSET(daemon_fd, &readfds)) {
+				fd = accept(daemon_fd, NULL, NULL);
+				accepted_port = daemon_port;
+			} else if (FD_ISSET(client_fd, &readfds)) {
+				fd = accept(client_fd, NULL, NULL);
+				accepted_port = client_port;
+			}
+
+			if (fd < 0) {
+				if (errno == EINTR || errno == EAGAIN)
+					continue;
+				tmate_fatal("Error accepting connection: %s", strerror(errno));
+			}
+
+			if ((pid = fork()) < 0)
+				tmate_fatal("Can't fork");
+
+			if (pid) {
+				/* Parent process */
+				close(fd);
+				continue;
+			}
+
+			/* Child process */
+
+			signal(SIGALRM, handle_sigalrm);
+			alarm(TMATE_SSH_GRACE_PERIOD);
+
+			/* Store which port accepted this connection */
+			client->connection_port = accepted_port;
+
+			if (get_client_ip(fd, client->ip_address, sizeof(client->ip_address)) < 0) {
+				if (tmate_settings->use_proxy_protocol)
+					tmate_fatal("Proxy header invalid. Load balancer may be misconfigured");
+				else
+					tmate_fatal("Error getting client IP from connection");
+			}
+
+			tmate_debug("Connection accepted on port %d ip=%s", accepted_port, client->ip_address);
+
+			/* Use the appropriate bind based on which port accepted */
+			ssh_bind bind_to_use = (accepted_port == daemon_port) ? daemon_bind : client_bind;
+			if (ssh_bind_accept_fd(bind_to_use, client->session, fd) < 0)
+				tmate_fatal("Error accepting connection: %s", ssh_get_error(bind_to_use));
+
+			ssh_bind_free(daemon_bind);
+			ssh_bind_free(client_bind);
+
+			client_bootstrap(session);
+			/* never reached */
 		}
+	} else {
+		/* Single port mode: listen on one port for all connections (backwards compatible) */
+		int listen_fd = ssh_bind_get_fd(daemon_bind);
 
-		/* Child process */
+		for (;;) {
+			fd = accept(listen_fd, NULL, NULL);
+			if (fd < 0) {
+				if (errno == EINTR || errno == EAGAIN)
+					continue;
+				tmate_fatal("Error accepting connection: %s", strerror(errno));
+			}
 
-		signal(SIGALRM, handle_sigalrm);
-		alarm(TMATE_SSH_GRACE_PERIOD);
+			if ((pid = fork()) < 0)
+				tmate_fatal("Can't fork");
 
-		if (get_client_ip(fd, client->ip_address, sizeof(client->ip_address)) < 0) {
-			if (tmate_settings->use_proxy_protocol)
-				tmate_fatal("Proxy header invalid. Load balancer may be misconfigured");
-			else
-				tmate_fatal("Error getting client IP from connection");
+			if (pid) {
+				/* Parent process */
+				close(fd);
+				continue;
+			}
+
+			/* Child process */
+
+			signal(SIGALRM, handle_sigalrm);
+			alarm(TMATE_SSH_GRACE_PERIOD);
+
+			/* In single port mode, all connections use daemon_port */
+			client->connection_port = daemon_port;
+
+			if (get_client_ip(fd, client->ip_address, sizeof(client->ip_address)) < 0) {
+				if (tmate_settings->use_proxy_protocol)
+					tmate_fatal("Proxy header invalid. Load balancer may be misconfigured");
+				else
+					tmate_fatal("Error getting client IP from connection");
+			}
+
+			tmate_debug("Connection accepted ip=%s", client->ip_address);
+
+			if (ssh_bind_accept_fd(daemon_bind, client->session, fd) < 0)
+				tmate_fatal("Error accepting connection: %s", ssh_get_error(daemon_bind));
+
+			ssh_bind_free(daemon_bind);
+
+			client_bootstrap(session);
+			/* never reached */
 		}
-
-		tmate_debug("Connection accepted ip=%s", client->ip_address);
-
-		if (ssh_bind_accept_fd(bind, client->session, fd) < 0)
-			tmate_fatal("Error accepting connection: %s", ssh_get_error(bind));
-
-		ssh_bind_free(bind);
-
-		client_bootstrap(session);
-		/* never reached */
 	}
 }
