@@ -158,6 +158,7 @@ struct tmate_ssh_client {
 	struct ssh_channel_callbacks_struct channel_cb;
 
 	int role;
+	int connection_port;  /* Which port accepted this connection */
 
 	char *username;
 	char *pubkey;
@@ -173,7 +174,8 @@ struct tmate_ssh_client {
 };
 
 extern void tmate_ssh_server_main(struct tmate_session *session,
-				  const char *keys_dir, const char *bind_addr, int port);
+				  const char *keys_dir, const char *bind_addr,
+				  int daemon_port, int client_port);
 
 /* tmate-main.c */
 
@@ -197,8 +199,10 @@ struct tmate_settings {
 	const char *keys_dir;
 	const char *authorized_keys_path;
 	bool authorized_keys_only;
-	int ssh_port;
-	int ssh_port_advertized;
+	int daemon_port;
+	int daemon_port_advertized;
+	int client_port;
+	int client_port_advertized;
 	const char *websocket_hostname;
 	int websocket_port;
 	const char *tmate_host;
